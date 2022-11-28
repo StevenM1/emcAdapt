@@ -22,17 +22,23 @@ adapt.c.emc <- function(feedback, arguments, learningRule='delta') {
     adaptedValues <- matrix(out$adaptedValues, nrow=nTrials, ncol=nAdapt)
     predictionErrors <- matrix(out$predictionErrors, nrow=nTrials, ncol=nAdapt)
     return(list(adaptedValues=adaptedValues, predictionErrors=predictionErrors))
-  } else if(learningRule == 'vkf') {
+  } else if(learningRule == 'vkf' | learningRule == 'vkfbinary') {
     # Variational Kalman filter
     predictionsStartValues <- arguments$predictionsStartValues
     volatilitiesStartValues <- arguments$volatilitiesStartValues
     volatilityLearningRates <- arguments$volatilityLearningRates
     uncertaintiesStartValues <- arguments$uncertaintiesStartValues
 
+    if(learningRule == 'vkfbinary') {
+      ccall <- 'adaptVKFbinary'
+    } else {
+      ccall <- 'adaptVKF'
+    }
+
     ## empty output arrays
     predictions <- predictionErrors <- learningRates <- volatilities <- volatilityPredictionErrors <- uncertainties <- matrix(nrow=nTrials, ncol=nAdapt)
 
-    out = .C('adaptVKF',
+    out = .C(ccall,
              nTrials=nTrials,
              nChoices=nAdapt,
              # Predictions
@@ -235,6 +241,103 @@ vkf.r <- function(x, data, sample = FALSE, updateOnly=TRUE) {
   }
 }
 
+vkf_binary.r <- function(x, data, sample = FALSE, updateOnly=TRUE) {
+  #       data: column-vector of outcomes
+  #       0<lambda<1, volatility learning rate
+  #       v0>0, initial volatility
+  #       sigma2>0, outcome noise
+  #       sigmar = simulation response noise (sd)
+  #       mu0 = initial value of mu (assumed to be 0 in code below)
+  # also see https://github.com/payampiray/VKF/blob/master/vkf.m
+
+  if (is.null(names(x))) {
+    names(x) <- c("lambda", "v0", "omega", "sigmar", "mu0")
+  }
+
+  # extract parameters
+  lambda <- x[["lambda"]]
+  v0 <- x[["v0"]]
+  omega <- x[["omega"]]
+
+  # number of trials
+  nt <- nrow(data)
+
+  # initial values
+  m <- 300 * x[["mu0"]]
+  w0 <- x[["omega"]]
+  w <- w0
+  v <- x[["v0"]]
+
+  predictions <- numeric(nt)
+  learning_rate <- numeric(nt)
+  volatility <- numeric(nt)
+  prediction_error <- numeric(nt)
+  volatility_error <- numeric(nt)
+  uncertainty <- numeric(nt)
+
+  for (t in seq_len(nt)) {
+
+    o <- data$o[t]
+    predictions[t] <- m
+    volatility[t] <- v
+    uncertainty[t] <- w
+
+    mpre <- m
+    wpre <- w
+
+    k       <- (w + v) / (w + v + omega)                          # Eq 14
+    alpha   <- sqrt(w + v)                                        # Eq 15
+    delta_m <- o - (1/(1+exp(-m)))                                # Eq 16 (sigmoid)
+    m       <- m + alpha * delta_m                                # Eq 16
+    w       <- (1 - k) * (w + v)                                  # Eq 17
+
+    wcov    <-  (1 - k) * wpre                                    # Eq 18
+    delta_v <-  (m - mpre)^2 + w + wpre - 2 * wcov - v            # Eq 19.1
+    v       <-  v + lambda * delta_v                              # Eq 19.2
+
+    learning_rate[t] <- alpha                                     # learning rate is now alpha!!
+    prediction_error[t] <- delta_m
+    volatility_error[t] <- delta_v
+  }
+
+  if(updateOnly) {
+    return(list(predictions = predictions,
+                volatility = volatility,
+                learning_rate = learning_rate,
+                prediction_error = prediction_error,
+                volatility_error = volatility_error,
+                uncertainty = uncertainty))
+  }
+  # response model
+  if (sample) {
+
+    # generate responses
+    data$r <- rnorm(nt, mean = predictions, sd = x[["sigmar"]])
+    attr(data, "latent_state_pars") <- list(predictions = predictions,
+                                            volatility = volatility,
+                                            learning_rate = learning_rate,
+                                            prediction_error = prediction_error,
+                                            volatility_error = volatility_error,
+                                            uncertainty = uncertainty)
+    return(data)
+
+
+  } else {
+
+    out <- sum(dnorm(data$r,
+                     mean = predictions,
+                     sd = x[["sigmar"]],
+                     log = TRUE))
+    attr(data, "latent_state_pars") <- list(predictions = predictions,
+                                            volatility = volatility,
+                                            learning_rate = learning_rate,
+                                            prediction_error = prediction_error,
+                                            volatility_error = volatility_error,
+                                            uncertainty = uncertainty)
+    return(out)
+
+  }
+}
 
 
 # Testing VKF -------------------------------------------------------------
@@ -283,6 +386,54 @@ vkf.r <- function(x, data, sample = FALSE, updateOnly=TRUE) {
 #       min       lq      mean   median        uq      max neval
 #   67.978   83.517  107.8521   92.824  103.9555 1274.075   100
 # 1183.014 1215.014 1349.7270 1252.796 1352.3645 4342.310   100
+
+
+# Testing BINARY VKF -------------------------------------------------------------
+# feedback = matrix(rnorm(20), ncol=2)
+# predictionsStartValues = rep(0, ncol(feedback))
+# volatilitiesStartValues = rep(.1, ncol(feedback))
+# uncertaintiesStartValues = rep(1, ncol(feedback))
+# volatilityLearningRates = matrix(.1, nrow=nrow(feedback), ncol=ncol(feedback))
+#
+# out = adapt.c.emc(feedback=feedback, learningRule='vkfbinary',
+#                   arguments=list(predictionsStartValues=predictionsStartValues,
+#                                  volatilitiesStartValues=volatilitiesStartValues,
+#                                  uncertaintiesStartValues=uncertaintiesStartValues,
+#                                  volatilityLearningRates=volatilityLearningRates))
+#
+# ## compare with Q's implementation
+# column <- 2
+# x <- c("lambda"=volatilityLearningRates[1,column],    # volatility learning rate
+#        "v0"=volatilitiesStartValues[column],        # volatility start value
+#        "omega"=uncertaintiesStartValues[column],    # uncertainty start value
+#        "sigmar"=uncertaintiesStartValues[column],    # simulation noise, unused for updating
+#        "mu0"=predictionsStartValues[column]      # prediction start value
+#        )
+# out2 <- vkf_binary.r(x, data=data.frame(o=feedback[,column]), updateOnly=TRUE)
+#
+# all(out2$predictions==out$adaptedPredictions[,column])
+# all(out2$volatility==out$adaptedVolatilities[,column])
+# all(out2$uncertainty==out$adaptedUncertainties[,column])
+#
+#
+# # speed comparison
+# feedback = matrix(rnorm(2000), ncol=1)
+# predictionsStartValues = rep(0, ncol(feedback))
+# volatilitiesStartValues = rep(.1, ncol(feedback))
+# uncertaintiesStartValues = rep(1, ncol(feedback))
+# volatilityLearningRates = matrix(.1, nrow=nrow(feedback), ncol=ncol(feedback))
+#
+# library(microbenchmark)
+# microbenchmark(adapt.c.emc(feedback=feedback, learningRule='vkfbinary',
+#                            arguments=list(predictionsStartValues=predictionsStartValues,
+#                                           volatilitiesStartValues=volatilitiesStartValues,
+#                                           uncertaintiesStartValues=uncertaintiesStartValues,
+#                                           volatilityLearningRates=volatilityLearningRates)),
+#                vkf_binary.r(x, data=data.frame(o=feedback), updateOnly=TRUE))
+# Unit: microseconds
+# min        lq       mean   median        uq      max neval
+# 75.973   89.7285   98.45125   97.088  103.3405  168.428   100
+# 1346.276 1365.3820 1481.72811 1382.028 1410.5435 3725.588   100
 
 
 

@@ -181,6 +181,133 @@ void adaptVKF(int *nTrials,
 }
 
 
+// VKF binary case
+void adaptVKFbinary(int *nTrials,
+              int *nChoices,
+
+              double *predictions,               // m (size nc)
+              double *adaptedPredictions,        // m (size nt x nc)
+              double *predictionErrors,          // delta_m (size nt x nc)
+              double *learningRates,             // k (size nt x nc)
+
+              double *volatilities,               // v (size nc)
+              double *adaptedVolatilities,        // v (size nt x nc)
+              double *volatilityPredictionErrors, // delta_v (size nt x nc)
+              double *volatilityLearningRates,    // lambda (size nt x nc)
+
+              double *uncertainties,              // w (size nc)
+              double *adaptedUncertainties,       // w (size nt x nc)
+              // double *sigma2,                     // size nc (never updated)
+
+              double *outcomes                   // rewards size (nt x nc)
+) {
+
+  // nTrials: number of trials
+  // nChoices: total number of choice options. For example, 3 pairs of 2 stimuli = 6 choices
+  // predictions: initial value of each choice option (length nChoices)
+  // adaptedPredictions: output for trial-by-trial values of each choice option. In R, a matrix of size (nTrials, nChoices); here in C, an array of length (nTrials*nChoices)
+  // predictionErrors: output for trial-by-trial prediction errors for each chocie option. Identical size as adaptedPredictions
+  // learningRates: output for trial-by-trial learning rates per choice option
+
+  // volatilities: initial value of each choice option's volatility
+  // adaptedVolatility: output for trial-by-trial volatility of each choice option
+  // volatilityPredictionErrors: output for trial-by-trial prediction errors for each choice option's volatility
+  // volatilityLearningRates: input for trial-by-trial volatility learning rates per choice option
+
+  // uncertainties: initial value of each choice option's uncertainty
+  // adaptedUncertainties: output for uncertainties
+
+  // outcomes: (nTrials, nChoices): trial by trial outcomes per choice option. NA is no output.
+
+  // declare some variables
+
+  // placeholders
+  double this_lr;             // alpha
+  double this_kalman_gain;    // k
+  double this_volatility;     // v
+  double this_uncertainty;    // w
+  double this_volatility_lr;  // lambda
+
+  double mpre;
+  double wpre;
+  double wcov;
+  double delta_v;
+
+  // indexers, sizes
+  int mat_idx = 0;
+  int nt = *nTrials;
+  int nc = *nChoices;
+
+  // to keep track of prediction errors per choice option
+  static double delta_prediction[64] = {0};              // WARNING: MAXIMUM NUMBER OF CHOICES IS FIXED HERE TO 64. Anything more will crash.
+  static double delta_volatility[64] = {0};   // WARNING: MAXIMUM NUMBER OF CHOICES IS FIXED HERE TO 64. Anything more will crash.
+
+  // copy initial uncertainties to omega
+  static double omega[64] = {0};  // omega = initial uncertainty, and static
+  for(unsigned int ch = 0; ch < nc; ch++) {
+    omega[ch] = uncertainties[ch];
+  }
+
+  // Loop over trials i
+  for(unsigned int i = 0; i < nt; i++) {
+    //    printf("Trial N: %d\n", i);
+    //    this_eta1 = eta1[i];  // trialwise learning rate for positive PE
+    //    this_eta2 = eta2[i];  // trialwise learning rate for negative PE
+
+    // Loop over choice alternatives
+    for(unsigned int ch = 0; ch < nc; ch++) {
+      //      printf("Choice option: %d\n", ch);
+      mat_idx = nt*ch+i;  // Where in the VV-matrix and outcome-matrix are we?
+      adaptedPredictions[mat_idx] = predictions[ch];     // Offload current values
+      adaptedVolatilities[mat_idx] = volatilities[ch];   // Offload current values
+      adaptedUncertainties[mat_idx] = uncertainties[ch]; // Offload current values
+
+      // If the outcome for this choice was not NA, update (note that o_ == o_ returns FALSE if o_ is NA)
+      if(outcomes[mat_idx] == outcomes[mat_idx]) {
+
+        this_volatility_lr = volatilityLearningRates[mat_idx];
+        mpre = predictions[ch];
+        wpre = uncertainties[ch];
+
+        // printf("Uncertainty: %f\n", sigma2[ch]);
+
+        // prediction error dv = outcome choice - value of choice, eq 16.1
+        delta_prediction[ch] = outcomes[mat_idx] - (1 / (1+exp(-predictions[ch])));
+
+        // kalman gain,    Eq 14
+        this_kalman_gain = (uncertainties[ch] + volatilities[ch]) / (uncertainties[ch] + volatilities[ch] + omega[ch]);
+        // printf("uncertainties[ch]: %f, volatilities[ch]: %f, sigma2[ch]: %f, resulting this_lr: %f\n", uncertainties[ch], volatilities[ch], sigma2[ch], this_lr);
+
+        // learning rate, Eq 15
+        this_lr = sqrt(uncertainties[ch] + volatilities[ch]);
+
+        // prediction, eq 16.2
+        predictions[ch] = predictions[ch] + this_lr * delta_prediction[ch];
+        // uncertainty, Eq 11
+        uncertainties[ch] = (1 - this_kalman_gain) * (uncertainties[ch] + volatilities[ch]);
+
+        // covariance of uncertainty? Eq 12
+        wcov = (1 - this_kalman_gain) * wpre;
+        // printf("this_kalman_gain: %f, wpre: %f, resultig wcov: %f\n", this_kalman_gain, wpre, wcov);
+
+        // volatility error
+        delta_volatility[ch] =  pow(predictions[ch] - mpre, 2) + uncertainties[ch] + wpre - 2 * wcov - volatilities[ch];
+        // printf("predictions[ch]: %f, mpre: %f, uncertainties[ch]: %f, wpre: %f, wcov: %f, volatilities[ch]: %f, resulting delta_volatility[ch]: %f\n", predictions[ch], mpre, uncertainties[ch], wpre, wcov, volatilities[ch], delta_volatility[ch]);
+
+        // update volatility, Eq 13
+        volatilities[ch] = volatilities[ch] + this_volatility_lr*delta_volatility[ch];
+        // printf("volatilities[ch]: %f = volatilities[ch]: %f + this_volatility_lr[ch]: %f * delta_volatility: %f\n", volatilities[ch], volatilities[ch], this_volatility_lr, delta_volatility[ch]);
+
+        // printf("\n");
+        // save what we want to save: PEs, volatility PEs, learning rates
+        predictionErrors[mat_idx] = delta_prediction[ch];  // offload PE
+        learningRates[mat_idx] = this_lr;
+        volatilityPredictionErrors[mat_idx] = delta_volatility[ch];
+      }
+    }
+  }
+}
+
 // // Dual learning rates
 // void adaptSARSA2LR(int *nTrials,
 //                    int *nChoices,
